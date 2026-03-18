@@ -1,0 +1,11 @@
+node_modules/
+node_module/
+PLAN.md
+.next/
+*.tsbuildinfo
+.venv/
+__pycache__/
+*.pyc
+data/
+resuot_output/
+*.pptx

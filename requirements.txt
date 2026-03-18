@@ -1,0 +1,19 @@
+# Core
+pymupdf>=1.24
+pillow>=10.3
+numpy>=1.26
+opencv-python-headless>=4.10
+
+# OCR engines
+# IMPORTANT:
+# Install PaddlePaddle separately before using PaddleOCR / PaddleOCR-VL.
+# Examples (choose ONE that matches your environment):
+#   CPU: python -m pip install paddlepaddle==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+#   GPU: python -m pip install paddlepaddle-gpu==3.2.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+# Then install PaddleOCR extras:
+paddleocr[all]>=3.2.0
+# For PaddleOCR-VL / doc parser:
+# paddleocr[doc-parser]>=3.2.0
+
+# Optional
+# surya-ocr
