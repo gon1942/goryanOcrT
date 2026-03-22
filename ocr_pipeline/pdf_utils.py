@@ -44,6 +44,33 @@ def extract_pdf_page_texts(pdf_path: str | Path) -> list[str]:
     return texts
 
 
+def extract_pdf_page_words(
+    pdf_path: str | Path,
+    page_no: int,
+    *,
+    scale_to: tuple[int, int] | None = None,
+) -> list[tuple[float, float, float, float, str]]:
+    fitz = _lazy_import_fitz()
+    doc = fitz.open(str(pdf_path))
+    page_index = max(0, page_no - 1)
+    if page_index >= len(doc):
+        return []
+    page = doc.load_page(page_index)
+    rect = page.rect
+    sx = 1.0
+    sy = 1.0
+    if scale_to and rect.width and rect.height:
+        sx = float(scale_to[0]) / float(rect.width)
+        sy = float(scale_to[1]) / float(rect.height)
+    words: list[tuple[float, float, float, float, str]] = []
+    for x0, y0, x1, y1, text, *_ in page.get_text("words"):
+        token = str(text).strip()
+        if not token:
+            continue
+        words.append((x0 * sx, y0 * sy, x1 * sx, y1 * sy, token))
+    return words
+
+
 def render_pdf_to_images(pdf_path: str | Path, out_dir: str | Path, dpi: int = 200) -> list[Path]:
     fitz = _lazy_import_fitz()
     doc = fitz.open(str(pdf_path))

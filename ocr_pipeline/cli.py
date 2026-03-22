@@ -18,6 +18,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-merge-cross-page-tables", action="store_true")
     parser.add_argument("--no-relevel-titles", action="store_true")
     parser.add_argument("--concatenate-pages", action="store_true")
+    parser.add_argument("--disable-table-refine", action="store_true")
+    parser.add_argument("--table-refine-engine", default="table_recognition", choices=["paddle_vl", "paddle_ocr", "table_recognition"])
+    parser.add_argument("--table-refine-dpi", type=int, default=400)
     return parser
 
 
@@ -32,6 +35,9 @@ def main() -> None:
         concatenate_pages=args.concatenate_pages,
     )
     config.preprocess.enabled = not args.disable_preprocess
+    config.table_refine.enabled = not args.disable_table_refine
+    config.table_refine.engine = args.table_refine_engine
+    config.table_refine.dpi = args.table_refine_dpi
     pipeline = OCRPipeline(config)
     doc = pipeline.run(Path(args.input), Path(args.output_dir))
     print(f"done: pages={doc.page_count}, engine={doc.engine_used}, confidence={doc.overall_confidence:.3f}")

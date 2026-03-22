@@ -115,8 +115,8 @@ python run_ocr.py \
 
 
 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=1 python run_ocr.py \
-  --input ./samp/input4.pdf \
-  --output-dir ./output_input4 \
+  --input ./samp/input7.pdf \
+  --output-dir ./output_input7 \
   --engine paddle_vl \
   --device gpu
 
@@ -187,6 +187,8 @@ auto = 조건에 따라 엔진 자동 선택
 - PaddleOCR / PaddleOCR-VL 어댑터
 - confidence 기반 검토 플래그
 - HTML/MD/JSON 출력
+- **PaddleOCR-VL LoRA 파인튜닝** (한국어 도메인 특화)
+- **SLANet 테이블 구조 인식 미세조정**
 
 추가 개발이 필요한 것:
 - Surya 비교 판독 결합
@@ -194,6 +196,329 @@ auto = 조건에 따라 엔진 자동 선택
 - rowspan/colspan 후처리 고도화
 - 숫자/합계 검증기 강화
 - DB 적재 / API 서버화
+
+---
+
+## 엔진 커스터마이징
+
+PaddleOCR-VL(메인 OCR 엔진)과 SLANet(테이블 구조 인식)을 파인튜닝하여
+한국어 비즈니스 문서 특화 성능을 향상시킬 수 있습니다.
+
+### 아키텍처 개요
+
+```
+┌─────────────────────────────────────────────┐
+│  PaddleOCR-VL-1.5-0.9B (958M params)       │
+│  ┌─────────────────────────────────────┐    │
+│  │  LoRA Adapter (4.5M params, 0.47%)  │    │
+│  │  타겟: q/k/v/o_proj, gate/up/down  │    │
+│  └─────────────────────────────────────┘    │
+└─────────────────────────────────────────────┘
+                    ↓
+┌─────────────────────────────────────────────┐
+│  Table Refiner: SLANet_plus                 │
+│  테이블 셀 바운딩박스 인식 → 구조 복원       │
+│  (PaddleX 공식 파인튜닝 지원)                │
+└─────────────────────────────────────────────┘
+                    ↓
+┌─────────────────────────────────────────────┐
+│  Post-processing (Python)                   │
+│  rowspan/colspan 복원, 빈 셀 정리           │
+│  PDF text layer 교차 검증                   │
+└─────────────────────────────────────────────┘
+```
+
+### 요구사양
+
+| 항목 | 최소 권장 |
+|------|----------|
+| GPU | NVIDIA RTX 3090 (24GB) 1장 |
+| RAM | 16GB |
+| 디스크 | 모델 캐시 ~4GB + 학습 데이터 ~1GB |
+| Python | 3.10 ~ 3.12 |
+| CUDA | 12.x |
+
+### 파인튜닝 전용 패키지 설치
+
+기존 PaddlePaddle/PaddleOCR 설치에 추가로 다음을 설치합니다.
+
+```bash
+pip install peft bitsandbytes transformers torch accelerate
+```
+
+> `peft`는 LoRA 어댑터 적용/학습에 사용합니다.
+> `bitsandbytes`는 QLoRA(4-bit 양자화) 학습에 필요합니다 (VRAM 절약용).
+> `transformers`/`torch`는 PaddleOCR-VL 모델이 내부적으로 PyTorch 기반이므로 필요합니다.
+
+### Step 1: 학습 데이터 생성
+
+기존 파이프라인 출력 결과에서 테이블 이미지와 HTML 정답 쌍을 추출합니다.
+**파이프라인을 새로 실행하지 않고** 이미 생성된 `result.pretty.json`과
+`table_refine/crops/`를 재사용합니다.
+
+#### VL (PaddleOCR-VL) 학습 데이터
+
+```bash
+# 단일 출력 디렉토리에서 생성
+python scripts/prepare_vl_training_data_lite.py \
+    --input-dir output_input7_v8/ \
+    --output-dir data/vl_training/
+
+# 여러 출력 디렉토리를 한 번에 (glob 매칭)
+python scripts/prepare_vl_training_data_lite.py \
+    --input-dir output_input7_v8/ \
+    --output-dir data/vl_training/ \
+    --val-ratio 0.2
+```
+
+출력:
+```
+data/vl_training/
+├── train.jsonl    # 학습용 (이미지 경로, 프롬프트, HTML 응답)
+├── val.jsonl      # 검증용
+```
+
+JSONL 각 줄의 형식:
+```json
+{
+  "image": "/절대경로/crop.png",
+  "prompt": "Table Recognition:",
+  "response": "<table border=1><tr><td>구분</td>...</tr></table>",
+  "source": "input7.pdf",
+  "page": 1,
+  "block_id": "p1_b6"
+}
+```
+
+#### SLANet 학습 데이터
+
+```bash
+python scripts/prepare_slanet_training_data_lite.py \
+    --input-dir output_input7_v8/ \
+    --output-dir data/slanet_training/
+```
+
+출력:
+```
+data/slanet_training/
+├── train.txt      # PubTabTableRecDataset 포맷
+├── val.txt
+└── images/        # 테이블 crop 이미지 복사본
+    ├── table_0000.png
+    ├── table_0001.png
+    └── ...
+```
+
+#### 전체 파이프라인 재실행으로 데이터 생성 (데이터 추가 시)
+
+여러 PDF에서 한 번에 데이터를 모으려면:
+
+```bash
+# 테이블 전용
+python scripts/prepare_vl_training_data.py \
+    --input-dir samp/ \
+    --output-dir data/vl_training_full/ \
+    --table-only \
+    --val-ratio 0.2
+
+# 테이블 + 텍스트 모두
+python scripts/prepare_vl_training_data.py \
+    --input-dir samp/ \
+    --output-dir data/vl_training_full/ \
+    --val-ratio 0.2
+```
+
+> 이 스크립트는 내부에서 파이프라인을 실행하므로 시간이 오래 걸립니다.
+> 이미 처리한 결과가 있다면 `*_lite.py`를 사용하세요.
+
+### Step 2: PaddleOCR-VL LoRA 파인튜닝
+
+```bash
+# 기본 학습 (float16, gradient checkpointing)
+python scripts/train_lora_vl.py \
+    --data-dir data/vl_training/ \
+    --output-dir models/lora_vl_v1/ \
+    --epochs 10 \
+    --batch-size 1 \
+    --grad-accum 8 \
+    --use-cp
+
+# QLoRA (4-bit 양자화, VRAM 절약)
+python scripts/train_lora_vl.py \
+    --data-dir data/vl_training/ \
+    --output-dir models/lora_vl_v1/ \
+    --epochs 10 \
+    --batch-size 1 \
+    --grad-accum 8 \
+    --use-qlora \
+    --use-cp
+
+# 이어서 학습 (checkpoint에서 재개)
+python scripts/train_lora_vl.py \
+    --data-dir data/vl_training/ \
+    --output-dir models/lora_vl_v1/ \
+    --resume-from models/lora_vl_v1/checkpoint-5/
+```
+
+**주요 파라미터:**
+
+| 파라미터 | 기본값 | 설명 |
+|---------|--------|------|
+| `--model-path` | `~/.paddlex/official_models/PaddleOCR-VL-1.5` | 베이스 모델 경로 |
+| `--epochs` | 3 | 학습 에포크 수 |
+| `--batch-size` | 1 | 배치 크기 (큰 이미지는 1 권장) |
+| `--grad-accum` | 8 | 그래디언트 누적 스텝 (effective = batch x accum) |
+| `--lr` | 2e-4 | 학습률 |
+| `--lora-rank` | 8 | LoRA 랭크 |
+| `--lora-alpha` | 16 | LoRA 스케일링 팩터 |
+| `--max-length` | 4096 | 최대 시퀀스스 길이 |
+| `--use-qlora` | false | 4-bit 양자화 사용 (VRAM ~12GB) |
+| `--use-cp` | false | gradient checkpointing 사용 |
+
+**VRAM 요구량:**
+| 모드 | VRAM |
+|------|------|
+| float16 + grad checkpoint | ~16GB |
+| QLoRA (4-bit) + grad checkpoint | ~12GB |
+| float32 (테스트용) | ~20GB |
+
+**출력 구조:**
+```
+models/lora_vl_v1/
+├── final/                     # 최종 LoRA 어댑터
+│   ├── adapter_config.json    # LoRA 설정
+│   ├── adapter_model.safetensors  # 가중치 (~18MB)
+│   └── tokenizer.model        # 토크나이저
+├── checkpoint-1/               # 에포크별 체크포인트
+├── checkpoint-2/
+└── train_args.json            # 학습 인자 기록
+```
+
+### Step 3: SLANet 테이블 구조 인식 미세조정
+
+```bash
+python scripts/train_slanet.py \
+    --data-dir data/slanet_training/ \
+    --output-dir models/slanet_custom_v1/ \
+    --model-name SLANet_plus \
+    --epochs 50 \
+    --batch-size 4 \
+    --lr 1e-4
+```
+
+| 파라미터 | 기본값 | 설명 |
+|---------|--------|------|
+| `--model-name` | SLANet_plus | 베이스 모델 (SLANet, SLANeXt_wired 등) |
+| `--epochs` | 50 | 학습 에포크 수 |
+| `--batch-size` | 4 | 배치 크기 |
+| `--lr` | 1e-4 | 학습률 |
+| `--max-len` | 1024 | 테이블 이미지 최대 리사이즈 길이 |
+| `--gpu` | 0 | 사용할 GPU 디바이스 ID |
+
+### Step 4: 파인튜닝된 모델로 추론
+
+#### 방법 A: Config로 LoRA 활성화
+
+```python
+from ocr_pipeline.config import PipelineConfig
+
+config = PipelineConfig()
+config.lora.enabled = True
+config.lora.adapter_path = "models/lora_vl_v1/final"
+config.table_refine.model_path = "models/slanet_custom_v1/export"
+
+# 파이프라인 실행
+pipeline = OCRPipeline(config)
+doc = pipeline.run("input.pdf", "output/")
+```
+
+#### 방법 B: Transformers로 LoRA 어댑터 직접 로드
+
+PaddleOCR 파이프라인(PaddlePaddle 런타임)과는 별도로,
+transformers 기반으로 LoRA 적용 모델을 직접 사용할 수 있습니다.
+
+```python
+import torch
+from transformers import AutoModelForCausalLM, AutoProcessor
+from peft import PeftModel
+
+# 베이스 모델 로드
+model = AutoModelForCausalLM.from_pretrained(
+    "~/.paddlex/official_models/PaddleOCR-VL-1.5",
+    trust_remote_code=True,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+)
+
+# LoRA 어댑터 결합
+model = PeftModel.from_pretrained(model, "models/lora_vl_v1/final")
+
+# 프로세서 로드
+processor = AutoProcessor.from_pretrained(
+    "~/.paddlex/official_models/PaddleOCR-VL-1.5",
+    trust_remote_code=True,
+)
+
+# 추론
+from PIL import Image
+image = Image.open("table_crop.png")
+messages = [
+    {"role": "user", "content": [
+        {"type": "image"},
+        {"type": "text", "text": "Table Recognition:"},
+    ]},
+]
+prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+inputs = processor(images=image, text=prompt, return_tensors="pt").to(model.device)
+output = model.generate(**inputs, max_new_tokens=4096)
+result = processor.decode(output[0], skip_special_tokens=True)
+```
+
+### 학습 데이터 확보
+
+현재 `samp/` 폴더의 10개 PDF에서 생성 가능한 학습 데이터량:
+
+| PDF | 테이블 수 | 텍스트 블록 수 |
+|-----|---------|---------------|
+| input1 ~ input10 | ~30-60개 | ~50-100개 |
+
+**권장:** 최소 100개 이상의 테이블 샘플로 학습하세요.
+데이터가 부족하면 과적합이 발생합니다.
+
+데이터를 늘리는 방법:
+1. `samp/`의 다른 PDF로 `prepare_vl_training_data.py` 실행
+2. 비슷한 도메인의 한국어 비즈니스 문서 추가
+3. `--table-only` 없이 실행하면 텍스트 블록도 학습 데이터에 포함
+
+### 스크립트 참고
+
+```
+scripts/
+├── prepare_vl_training_data.py         # 파이프라인 실행 + 데이터 추출 (무거움)
+├── prepare_vl_training_data_lite.py     # 기존 출력 재사용 (가벼움)
+├── prepare_slanet_training_data.py      # 파이프라인 실행 + SLANet 데이터 (무거움)
+├── prepare_slanet_training_data_lite.py # 기존 출력 재사용 (가벼움)
+├── train_lora_vl.py                     # PaddleOCR-VL LoRA 학습
+└── train_slanet.py                      # SLANet 미세조정
+```
+
+### 제한사항
+
+1. **LoRA 추론 경로**: 현재 PaddleOCR-VL은 PaddlePaddle 런타임으로 실행됩니다.
+   학습된 LoRA 어댑터를 PaddlePaddle 런타임에 직접 적용할 수 없습니다.
+   LoRA 적용 추론은 transformers 기반 별도 경로를 사용해야 합니다
+   (위 "방법 B" 참고).
+
+2. **데이터 부족**: `samp/`의 PDF는 10개뿐이므로, LoRA 파인튜닝 효과가 제한적입니다.
+   실제 도메인 문서 100+ 개에서 데이터를 확보하는 것을 권장합니다.
+
+3. **PaddleX SLANet 학습**: PaddleX의 `build_trainer` API가 버전에 따라 달라질 수 있습니다.
+   문제 발생 시 PaddleX CLI를 직접 사용하세요:
+   ```bash
+   paddlex train --model SLANet_plus --data data/slanet_training/ --output models/slanet_custom_v1/
+   ```
+
+---
 
 ## 자주 발생하는 오류
 
@@ -215,3 +540,18 @@ python -c "import paddle; print(paddle.__version__)"
 ```
 
 GPU wheel이 맞지 않으면 임시로 CPU 설치 후 `--device cpu`로 실행해도 됩니다.
+
+### LoRA 학습 시 `CUDA out of memory`
+
+해결:
+- `--use-qlora` 추가 (4-bit 양자화로 VRAM 절약)
+- `--use-cp` 추가 (gradient checkpointing)
+- `--batch-size 1` 고정
+- `--grad-accum`을 늘려 effective batch size 유지
+
+### LoRA 학습 시 `transformers` 관련 오류
+
+해결:
+```bash
+pip install --upgrade transformers peft bitsandbytes torch
+```

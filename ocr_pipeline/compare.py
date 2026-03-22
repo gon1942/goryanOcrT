@@ -246,19 +246,29 @@ del{background:#ffd6d6;text-decoration:none}
 
 def _compare_text_layer_pdf(input_path: Path, doc: OCRDocument, source_images: list[Path]) -> DocumentComparison:
     source_texts = extract_pdf_page_texts(input_path)
+    profile = doc.metadata.get("profile", {})
+    is_table_heavy = profile.get("layout_type") == "table_heavy"
     pages: list[PageComparison] = []
     for idx, page in enumerate(doc.pages, start=1):
         source_text = source_texts[idx - 1] if idx - 1 < len(source_texts) else ""
         ocr_text = _page_text(page)
-        similarity = _similarity(source_text, ocr_text)
-        status = _page_status(similarity, source_text, ocr_text)
-        mismatched_blocks = _compare_blocks_with_source_text(
-            page,
-            source_text,
-            include_source_only=similarity < 0.90,
-        )
-        if similarity >= 0.95:
-            mismatched_blocks = []
+
+        if is_table_heavy:
+            similarity, mismatched_blocks = _compare_table_heavy(page, source_text)
+            status = _page_status(similarity, source_text, ocr_text)
+            diff_html = _diff_html_tokens(source_text, ocr_text)
+        else:
+            similarity = _similarity(source_text, ocr_text)
+            status = _page_status(similarity, source_text, ocr_text)
+            mismatched_blocks = _compare_blocks_with_source_text(
+                page,
+                source_text,
+                include_source_only=similarity < 0.90,
+            )
+            if similarity >= 0.95:
+                mismatched_blocks = []
+            diff_html = _diff_html(source_text, ocr_text)
+
         page_comparison = PageComparison(
             page_no=page.page_no,
             source_available=bool(source_text),
@@ -268,11 +278,14 @@ def _compare_text_layer_pdf(input_path: Path, doc: OCRDocument, source_images: l
             similarity=similarity,
             status=status,
             source_image=_html_path(source_images[idx - 1]) if idx - 1 < len(source_images) else "",
-            text_diff_html=_diff_html(source_text, ocr_text),
+            text_diff_html=diff_html,
             mismatched_blocks=mismatched_blocks,
         )
         pages.append(page_comparison)
     overall = _mean([page.similarity for page in pages]) if pages else 0.0
+    notes = ["텍스트 레이어 PDF는 원본 텍스트와 OCR 텍스트를 직접 비교했습니다."]
+    if is_table_heavy:
+        notes.append("테이블 밀집 문서는 단어/토큰 수준 비교를 사용합니다 (줄 단위 비교는 테이블 구조 차이로 인해 왜곡됩니다).")
     return DocumentComparison(
         source_file=doc.source_file,
         comparable=True,
@@ -280,7 +293,7 @@ def _compare_text_layer_pdf(input_path: Path, doc: OCRDocument, source_images: l
         overall_similarity=overall,
         summary_status=_summary_status(overall, pages),
         pages=pages,
-        notes=["텍스트 레이어 PDF는 원본 텍스트와 OCR 텍스트를 직접 비교했습니다."],
+        notes=notes,
     )
 
 
@@ -399,6 +412,71 @@ def _collect_visual_review_blocks(page: OCRPage) -> list[BlockComparison]:
     return items
 
 
+def _compare_table_heavy(page: OCRPage, source_text: str) -> tuple[float, list[BlockComparison]]:
+    """Token-level comparison for table-heavy documents.
+
+    Line-by-line SequenceMatcher is fundamentally misleading for table docs
+    because the PDF text layer has each cell value on its own line, while OCR
+    outputs the entire table as one block. Instead, we compare on token (word)
+    level: tokenise both source and OCR text, then compute the fraction of
+    source tokens found in OCR tokens.
+    """
+    source_tokens = _tokenise(source_text)
+    ocr_tokens = _tokenise(_page_text(page))
+    if not source_tokens:
+        return (1.0 if not ocr_tokens else 0.0, [])
+    if not ocr_tokens:
+        return (0.0, [])
+
+    ocr_set = set(ocr_tokens)
+    matched = sum(1 for t in source_tokens if t in ocr_set)
+    similarity = matched / len(source_tokens)
+
+    # Identify per-block quality for table blocks
+    mismatched: list[BlockComparison] = []
+    for block in page.blocks:
+        block_text = _block_text(block)
+        if not block_text:
+            continue
+        block_tokens = _tokenise(block_text)
+        if not block_tokens:
+            continue
+        block_matched = sum(1 for t in block_tokens if t in ocr_set)
+        block_sim = block_matched / len(block_tokens)
+        if block_sim < 0.90 or block.review:
+            reasons = list(block.review_reason)
+            if block_sim < 0.90:
+                reasons.append("token_coverage_low")
+            mismatched.append(
+                BlockComparison(
+                    block_id=block.block_id,
+                    block_type=block.block_type,
+                    page_no=page.page_no,
+                    status="match" if block_sim >= 0.97 else ("partial" if block_sim >= 0.85 else "mismatch"),
+                    similarity=block_sim,
+                    source_text="",
+                    ocr_text=block_text,
+                    review_reason=sorted(set(reasons)),
+                    bbox=block.bbox,
+                )
+            )
+
+    if similarity >= 0.95:
+        mismatched = []
+    return similarity, mismatched
+
+
+def _tokenise(text: str) -> list[str]:
+    """Simple whitespace tokeniser that normalises and deduplicates."""
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for word in re.split(r"\s+", normalize_whitespace(text or "")):
+        if word and word not in seen:
+            tokens.append(word)
+            seen.add(word)
+    return tokens
+
+
 def _source_units(text: str) -> list[str]:
     lines = [normalize_whitespace(line) for line in (text or "").splitlines()]
     return [line for line in lines if line]
@@ -414,6 +492,12 @@ def _page_text(page: OCRPage) -> str:
 
 
 def _block_text(block: OCRBlock) -> str:
+    # Skip image/figure blocks — their content is HTML img tags, not comparable text
+    if block.block_type == "figure":
+        return ""
+    # For table blocks, always extract from HTML to avoid pipe syntax noise
+    if block.block_type == "table" and block.html:
+        return normalize_whitespace(_html_to_text(block.html))
     if block.text:
         return normalize_whitespace(_html_to_text(block.text))
     if block.markdown:
@@ -448,6 +532,20 @@ def _similarity(a: str, b: str) -> float:
     if not a_norm or not b_norm:
         return 0.0
     return SequenceMatcher(None, a_norm, b_norm).ratio()
+
+
+def _diff_html_tokens(source: str, ocr: str) -> str:
+    """Token-level diff for table-heavy documents — highlights missing/extra tokens."""
+    source_tokens = _tokenise(source)
+    ocr_tokens = _tokenise(ocr)
+    ocr_set = set(ocr_tokens)
+    pieces: list[str] = []
+    for token in source_tokens:
+        if token in ocr_set:
+            pieces.append(escape(token))
+        else:
+            pieces.append(f"<del>{escape(token)}</del>")
+    return " ".join(pieces).strip()
 
 
 def _diff_html(source: str, ocr: str) -> str:

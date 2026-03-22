@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Literal, Optional
 
 
-EngineName = Literal["auto", "paddle_vl", "paddle_ocr", "surya"]
+EngineName = Literal["auto", "paddle_vl", "paddle_ocr", "surya", "table_recognition"]
 
 
 @dataclass(slots=True)
@@ -37,6 +37,29 @@ class OutputConfig:
 
 
 @dataclass(slots=True)
+class TableRefineConfig:
+    enabled: bool = True
+    engine: EngineName = "table_recognition"
+    model_path: Optional[str] = None
+    """Custom fine-tuned SLANet model directory (e.g. models/slanet_custom_v1/export)."""
+    dpi: int = 400
+    padding: int = 24
+    max_tables_per_page: int = 8
+    min_crop_width: int = 160
+    min_crop_height: int = 80
+    prefer_larger_table: bool = True
+
+
+@dataclass(slots=True)
+class LoRAConfig:
+    enabled: bool = False
+    adapter_path: Optional[str] = None
+    """Path to LoRA adapter directory (e.g. models/lora_vl_v1/final)."""
+    lora_rank: int = 8
+    lora_alpha: int = 16
+
+
+@dataclass(slots=True)
 class PipelineConfig:
     engine: EngineName = "auto"
     language: str = "korean"
@@ -49,4 +72,6 @@ class PipelineConfig:
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
     review: ReviewConfig = field(default_factory=ReviewConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    table_refine: TableRefineConfig = field(default_factory=TableRefineConfig)
+    lora: LoRAConfig = field(default_factory=LoRAConfig)
     temp_dir: Optional[Path] = None

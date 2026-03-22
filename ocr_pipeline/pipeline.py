@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
+from html import unescape as html_unescape
 
 from .config import PipelineConfig
 from .compare import build_document_comparison, render_comparison_html
@@ -13,6 +15,8 @@ from .profile import profile_input
 from .quality import score_document
 from .review_overlay import draw_overlay
 from .schemas import OCRDocument
+from .table_refiner import TableRefiner
+from .table_rebuilder import clean_html_table
 from .utils.io import ensure_dir, save_json, save_text
 
 
@@ -42,6 +46,12 @@ class OCRPipeline:
         engine = self._select_engine(profile)
         work_dir = ensure_dir(output_dir / engine.name)
         doc = engine.process(effective_input, work_dir, profile)
+        # Free GPU memory before table refiner runs a second model
+        if self.config.table_refine.enabled:
+            del engine
+            import gc; gc.collect()
+            refiner = TableRefiner(self.config)
+            doc = refiner.refine_document(input_path, doc, output_dir)
         doc = score_document(doc, self.config.review)
 
         save_json(output_dir / "result.pretty.json", doc.to_dict())
@@ -63,11 +73,15 @@ class OCRPipeline:
         return doc
 
     def _select_engine(self, profile):
+        lora_path = None
+        if hasattr(self.config, "lora") and self.config.lora.enabled and self.config.lora.adapter_path:
+            lora_path = self.config.lora.adapter_path
         paddle_vl = PaddleVLAdapter(
             device=self.config.device,
             merge_tables=self.config.merge_cross_page_tables,
             relevel_titles=self.config.relevel_titles,
             concatenate_pages=self.config.concatenate_pages,
+            lora_path=lora_path,
         )
         paddle_ocr = PaddleOCRAdapter(device=self.config.device, language=self.config.language)
         surya = SuryaAdapter()
@@ -98,6 +112,10 @@ class OCRPipeline:
             return surya
         raise RuntimeError("사용 가능한 OCR 엔진이 없습니다. requirements와 설치 상태를 확인하세요.")
 
+    _HEADING_PREFIX_RE = re.compile(r"^#{1,6}\s+")
+    _HTML_TAG_RE = re.compile(r"<\s*(?:div|span|img|table|p|h[1-6])\b", re.I)
+    _ALL_TAG_RE = re.compile(r"<[^>]+>")
+
     def _render_markdown(self, doc: OCRDocument) -> str:
         lines = [f"# {doc.source_file}", ""]
         for page in doc.pages:
@@ -106,20 +124,36 @@ class OCRPipeline:
             if page.review_reason:
                 lines.append(f"> review: {', '.join(page.review_reason)}")
                 lines.append("")
+            prev_was_table = False
             for block in page.blocks:
+                if block.block_type == "figure":
+                    continue
                 if block.block_type == "title":
-                    lines.append(f"### {block.text}")
+                    clean_text = self._HEADING_PREFIX_RE.sub("", block.text or "")
+                    lines.append(f"### {clean_text}" if clean_text else f"### {block.text}")
+                    prev_was_table = False
                 elif block.block_type == "table":
-                    if block.markdown:
+                    # Add extra blank line between consecutive tables for visual separation
+                    if prev_was_table:
+                        lines.append("")
+                    table_html = clean_html_table(block.html) if block.html else ""
+                    if table_html:
+                        lines.append(table_html)
+                    elif block.markdown:
                         lines.append(block.markdown)
-                    elif block.html:
-                        lines.append(block.html)
                     lines.append("")
+                    prev_was_table = True
                 elif block.markdown:
                     lines.append(block.markdown)
                     lines.append("")
+                    prev_was_table = False
                 else:
                     if block.text:
-                        lines.append(block.text)
-                        lines.append("")
+                        text = block.text
+                        if self._HTML_TAG_RE.search(text):
+                            text = re.sub(r"\s+", " ", html_unescape(self._ALL_TAG_RE.sub(" ", text))).strip()
+                        if text:
+                            lines.append(text)
+                            lines.append("")
+                    prev_was_table = False
         return "\n".join(lines).strip() + "\n"

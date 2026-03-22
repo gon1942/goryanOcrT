@@ -8,4 +8,6 @@ __pycache__/
 *.pyc
 data/
 resuot_output/
+output_*/
+models/
 *.pptx

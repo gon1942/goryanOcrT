@@ -49,8 +49,11 @@ def score_document(doc: OCRDocument, review: ReviewConfig) -> OCRDocument:
         for block in page.blocks:
             score_block(block, review)
         score_page(page, review)
-    if doc.pages:
-        doc.overall_confidence = mean([p.page_confidence for p in doc.pages])
+    meaningful_pages = [p for p in doc.pages if p.blocks]
+    if meaningful_pages:
+        doc.overall_confidence = mean([p.page_confidence for p in meaningful_pages])
+    elif doc.pages:
+        doc.overall_confidence = 0.0
     else:
         doc.overall_confidence = 0.0
     doc.review_required_pages = [p.page_no for p in doc.pages if p.needs_review]
